@@ -45,6 +45,9 @@ cargo build --release
 
 ## Следующие челленджи
 
+cargo new --bin broadcast --vcs none
+
+
 - [ ] #2 Unique ID Generation (`unique-ids`)
 - [ ] #3 Broadcast (`broadcast`, 5 этапов)
 - [ ] #4 Grow-Only Counter (`counter`)

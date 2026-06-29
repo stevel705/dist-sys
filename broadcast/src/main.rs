@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
+    time::Instant,
 };
 
 use common::{Event, Init, Message, Node, main_loop};
@@ -29,12 +30,18 @@ enum Payload {
     },
 }
 
+struct InFlight {
+    msgs: HashSet<u64>,
+    last_sent: Instant,
+}
+
 struct BroadcastNode {
     node_id: String,
     next_msg_id: usize,
     messages: HashSet<u64>,                  // Store received messages
     topology: HashMap<String, Vec<String>>,  // Store topology information
     known_to: HashMap<String, HashSet<u64>>, // Store known messages for each neighbor
+    in_flight: HashMap<String, InFlight>,
 }
 
 impl BroadcastNode {
@@ -73,6 +80,7 @@ impl Node<Payload> for BroadcastNode {
             messages: HashSet::new(),
             topology,
             known_to: HashMap::new(),
+            in_flight: HashMap::new(),
         })
     }
 
@@ -97,11 +105,15 @@ impl Node<Payload> for BroadcastNode {
                                 },
                                 out,
                             )?;
-                            // Optimistic — считаем, что доставили
-                            self.known_to
-                                .entry(neighbor.clone())
-                                .or_default()
-                                .insert(*message);
+                            let entry =
+                                self.in_flight.entry(neighbor.clone()).or_insert_with(|| {
+                                    InFlight {
+                                        msgs: HashSet::new(),
+                                        last_sent: Instant::now(),
+                                    }
+                                });
+                            entry.msgs.insert(*message);
+                            entry.last_sent = Instant::now(); // ← всегда обновлять
                         }
                     }
 
@@ -118,7 +130,7 @@ impl Node<Payload> for BroadcastNode {
                     reply.send(out)?;
                 }
                 Payload::Topology { topology } => {
-                    self.topology = topology.clone(); 
+                    self.topology = topology.clone();
                     let reply = msg.into_reply(Payload::TopologyOk, &mut self.next_msg_id);
                     reply.send(out)?;
                 }
@@ -143,9 +155,16 @@ impl Node<Payload> for BroadcastNode {
                         .entry(msg.src.clone())
                         .or_default()
                         .extend(messages);
+
+                    if let Some(entry) = self.in_flight.get_mut(&msg.src) {
+                        entry.msgs.retain(|x| !messages.contains(x));
+                    }
                 }
             },
             Event::Tick => {
+                let now = Instant::now();
+                let ttl = std::time::Duration::from_millis(500);
+
                 let to_send: Vec<(String, HashSet<u64>)> = {
                     let neighbors = self
                         .topology
@@ -155,8 +174,29 @@ impl Node<Payload> for BroadcastNode {
                     let mut plan = Vec::new();
 
                     for neighbor in neighbors {
-                        let known = self.known_to.entry(neighbor.clone()).or_default();
-                        let diff: HashSet<u64> = self.messages.difference(known).copied().collect();
+                        let active = match self.in_flight.get(&neighbor) {
+                            Some(in_flight) if now.duration_since(in_flight.last_sent) < ttl => {
+                                in_flight.msgs.clone()
+                            }
+                            _ => HashSet::new(),
+                        };
+
+                        let empty;
+                        let known: &HashSet<u64> = match self.known_to.get(&neighbor) {
+                            Some(k) => k,
+                            None => {
+                                empty = HashSet::new();
+                                &empty
+                            }
+                        };
+
+                        let diff: HashSet<u64> = self
+                            .messages
+                            .difference(known) // вычесть подтверждённое
+                            .copied()
+                            .filter(|x| !active.contains(x)) // вычесть in-flight
+                            .collect();
+
                         if !diff.is_empty() {
                             plan.push((neighbor, diff));
                         }
@@ -165,6 +205,16 @@ impl Node<Payload> for BroadcastNode {
                 };
 
                 for (neighbor, diff) in to_send {
+                    let entry =
+                        self.in_flight
+                            .entry(neighbor.clone())
+                            .or_insert_with(|| InFlight {
+                                msgs: HashSet::new(),
+                                last_sent: now,
+                            });
+                    entry.msgs.extend(&diff);
+                    entry.last_sent = now;
+
                     self.send(neighbor.as_str(), Payload::Gossip { messages: diff }, out)?;
                 }
             }

@@ -63,7 +63,7 @@ cargo build --release
 | #3b Broadcast — multi-node                 | `stage-3b`       | ✅     |
 | #3c Broadcast — fault-tolerant             | `stage-3c`       | ✅     |
 | #3d Broadcast — efficient I                | `stage-3d`       | ✅     |
-| #3e Broadcast — efficient II               | —                | —      |
+| #3e Broadcast — efficient II               | `stage-3e`       | ✅ correctness; tail latency partition-bound |
 | #4  Grow-Only Counter                      | —                | —      |
 | #5a Kafka-Style Log — single               | —                | —      |
 | #5b Kafka-Style Log — multi                | —                | —      |

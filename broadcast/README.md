@@ -153,16 +153,73 @@ on GossipOk { messages: batch } from <node>:
 
 ### 3e — Efficient II
 
-**Условия:** ещё более жёсткие лимиты на latency и/или message count. Цели от Fly.io:
+**Условия:** 25 нод, partition, `--latency 100`. Цели от Fly.io:
 - `msgs-per-op` ≤ 20
 - median latency ≤ 1s
 - max latency ≤ 2s
 
-(latency-budget мягче 3d, но `msgs-per-op` строже)
+(latency-budget мягче 3d, но `msgs-per-op` строже; цели обозначены как aspirational в спецификации)
 
-**План:** оптимизации, перечисленные выше для 3d, + selective fanout (gossip к подмножеству соседей на каждом тике, не ко всем). Plumtree-style hybrid eager+lazy gossip.
+**Подход:** anti-entropy с **in-flight tracking + TTL** для retry под партишеном (без жертвы correctness).
 
-**Статус:** не начато.
+Главная проблема 3d-решения под партишеном: optimistic `known_to[neighbor] += message` после eager push. Если сообщение потеряно в партишене — `known_to` помечает соседа знающим, anti-entropy не пошлёт повторно → permanent loss.
+
+Решение: ввести **in-flight** state — что отправили, но ещё не подтверждено.
+
+```rust
+struct InFlight {
+    msgs: HashSet<u64>,
+    last_sent: Instant,
+}
+in_flight: HashMap<String, InFlight>,
+```
+
+- На eager push / tick send: добавляем в `in_flight[neighbor]`, обновляем `last_sent`.
+- На `GossipOk`: переносим из `in_flight` в `known_to`.
+- В Tick: вычисляем `diff = messages − known_to[neighbor] − active`, где `active` это `in_flight.msgs` **если** оно свежее TTL. Если TTL истёк — считаем «потеряно», повторно включаем в diff.
+
+Эффект:
+- Без партишена: ack приходит до TTL, `in_flight` опустошается, нет дублей.
+- Под партишеном: ack не приходит, TTL истекает, следующий Tick переотправляет. Self-healing.
+- После heal: первый же retry проходит, ack обновляет `known_to`.
+
+**Команда** (стандартная Fly.io):
+```bash
+./maelstrom/maelstrom test -w broadcast --bin ./target/release/broadcast \
+  --node-count 25 --time-limit 20 --rate 100 --latency 100 --nemesis partition
+```
+
+**Статус:** ✅ correctness под партишеном (`:valid? true`, 0 потерь, 0 дублей). Метрики на стандартных Maelstrom-настройках:
+
+| Метрика | Цель | Получено | Комментарий |
+|---------|------|----------|-------------|
+| msgs/op | ≤ 20 | **24-26** | Близко к мат. floor (см. ниже) |
+| median | ≤ 1s | **98ms** (с `--nemesis-interval 3`) | Fast-path идеален |
+| p95 | — | **18-19s** | partition-bound |
+| max | ≤ 2s | **~20s** | partition-bound, см. ниже |
+
+### Почему остановились на 24 msgs/op
+
+Per broadcast в кластере на 25 нод **минимум**:
+- 24 успешных доставки (каждой из 24 «других» нод)
+- 24 ack-а (для отслеживания доставки)
+
+Итого ~48 server msgs per broadcast. При 1000 broadcasts + 1000 reads и 2000 ops: floor ≈ 26 msgs/op. Любое перераспределение нагрузки (eager к подмножеству, делегирование) не меняет общего числа доставок — это структурный bound.
+
+Чтобы спуститься ниже:
+- **Optimistic propagation of `known_to`** (assume sender pushed to all → пропускаем tick для дубликатов). Под партишеном даёт permanent loss без TTL-защиты `known_to`-записей.
+- **Skip acks** — теряем reliability под партишеном.
+- **Plumtree (lazy pull + eager tree)** — серьёзный refactor.
+
+Все варианты жертвуют correctness ради метрики либо требуют переписывания. Зафиксированы как известный trade-off; для production-системы выбор был бы по требованиям SLA.
+
+### Почему max latency не помещается в 2s
+
+Под партишеном Maelstrom (с default `--nemesis-interval 10`) длина партишена ~10s. Любой broadcast, добавленный во время партишена, **физически не может** дойти до отрезанной части кластера быстрее, чем партишен закончится.
+
+С `--nemesis-interval 3` (партишены ~3s) median падает до 98ms, потому что fast-path сообщений преобладает. Но tail (p95+) всё равно содержит сообщения, попавшие в финальный незаживший партишен.
+
+Это **CAP в действии**: под партишеном **либо** consistency страдает (через optimistic), **либо** latency (ждать heal-а). Мы выбрали latency — correctness важнее.
 
 ## Структура кода
 

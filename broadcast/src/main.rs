@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
-    time::Instant,
 };
 
 use common::{Event, Init, Message, Node, main_loop};
@@ -22,21 +21,20 @@ enum Payload {
         topology: HashMap<String, Vec<String>>,
     },
     TopologyOk,
-}
-
-#[derive(Debug, Clone)]
-struct PendingGossip {
-    dst: String,
-    message: u64,
-    last_attempt: Instant,
+    Gossip {
+        messages: HashSet<u64>,
+    },
+    GossipOk {
+        messages: HashSet<u64>,
+    },
 }
 
 struct BroadcastNode {
     node_id: String,
     next_msg_id: usize,
-    messages: HashSet<u64>,                 // Store received messages
-    topology: HashMap<String, Vec<String>>, // Store topology information
-    pending: HashMap<usize, PendingGossip>,
+    messages: HashSet<u64>,                  // Store received messages
+    topology: HashMap<String, Vec<String>>,  // Store topology information
+    known_to: HashMap<String, HashSet<u64>>, // Store known messages for each neighbor
 }
 
 impl BroadcastNode {
@@ -74,7 +72,7 @@ impl Node<Payload> for BroadcastNode {
             next_msg_id: 1,
             messages: HashSet::new(),
             topology,
-            pending: HashMap::new(),
+            known_to: HashMap::new(),
         })
     }
 
@@ -83,29 +81,27 @@ impl Node<Payload> for BroadcastNode {
             Event::Message(msg) => match &msg.body.payload {
                 Payload::Broadcast { message } => {
                     let is_new = self.messages.insert(*message);
-                    if is_new {
-                        let neighbors: Vec<String> = self
+
+                    // Eager push only on client broadcasts (нода→нода идёт через Gossip)
+                    if is_new && msg.src.starts_with('c') {
+                        let neighbors = self
                             .topology
                             .get(&self.node_id)
                             .cloned()
                             .unwrap_or_default();
-
                         for neighbor in &neighbors {
-                            if neighbor != &msg.src {
-                                let msg_id = self.send(
-                                    neighbor,
-                                    Payload::Broadcast { message: *message },
-                                    out,
-                                )?;
-                                self.pending.insert(
-                                    msg_id,
-                                    PendingGossip {
-                                        dst: neighbor.clone(),
-                                        message: *message,
-                                        last_attempt: Instant::now(),
-                                    },
-                                );
-                            }
+                            self.send(
+                                neighbor,
+                                Payload::Gossip {
+                                    messages: HashSet::from([*message]),
+                                },
+                                out,
+                            )?;
+                            // Optimistic — считаем, что доставили
+                            self.known_to
+                                .entry(neighbor.clone())
+                                .or_default()
+                                .insert(*message);
                         }
                     }
 
@@ -122,47 +118,54 @@ impl Node<Payload> for BroadcastNode {
                     reply.send(out)?;
                 }
                 Payload::Topology { topology } => {
-                    self.topology = topology.clone();
+                    self.topology = topology.clone(); 
                     let reply = msg.into_reply(Payload::TopologyOk, &mut self.next_msg_id);
                     reply.send(out)?;
                 }
-                Payload::BroadcastOk => {
-                    if let Some(reply_to) = msg.body.in_reply_to {
-                        self.pending.remove(&reply_to);
-                    }
+                Payload::BroadcastOk | Payload::ReadOk { .. } | Payload::TopologyOk => {}
+                Payload::Gossip { messages } => {
+                    self.messages.extend(messages);
+                    self.known_to
+                        .entry(msg.src.clone())
+                        .or_default()
+                        .extend(messages);
+
+                    let messages = messages.clone();
+
+                    let reply = msg.into_reply(
+                        Payload::GossipOk { messages: messages },
+                        &mut self.next_msg_id,
+                    );
+                    reply.send(out)?;
                 }
-                Payload::ReadOk { .. } | Payload::TopologyOk => {}
+                Payload::GossipOk { messages } => {
+                    self.known_to
+                        .entry(msg.src.clone())
+                        .or_default()
+                        .extend(messages);
+                }
             },
             Event::Tick => {
-                let now = Instant::now();
-                let pending_ids: Vec<usize> = self
-                    .pending
-                    .iter()
-                    .filter_map(|(&id, pending)| {
-                        if now.duration_since(pending.last_attempt)
-                            >= std::time::Duration::from_millis(200)
-                        {
-                            Some(id)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let to_send: Vec<(String, HashSet<u64>)> = {
+                    let neighbors = self
+                        .topology
+                        .get(&self.node_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut plan = Vec::new();
 
-                for old_id in pending_ids {
-                    let Some(p) = self.pending.remove(&old_id) else {
-                        continue;
-                    };
-                    let new_msg_id =
-                        self.send(&p.dst, Payload::Broadcast { message: p.message }, out)?;
-                    self.pending.insert(
-                        new_msg_id,
-                        PendingGossip {
-                            dst: p.dst,
-                            message: p.message,
-                            last_attempt: Instant::now(),
-                        },
-                    );
+                    for neighbor in neighbors {
+                        let known = self.known_to.entry(neighbor.clone()).or_default();
+                        let diff: HashSet<u64> = self.messages.difference(known).copied().collect();
+                        if !diff.is_empty() {
+                            plan.push((neighbor, diff));
+                        }
+                    }
+                    plan
+                };
+
+                for (neighbor, diff) in to_send {
+                    self.send(neighbor.as_str(), Payload::Gossip { messages: diff }, out)?;
                 }
             }
         }
@@ -170,7 +173,7 @@ impl Node<Payload> for BroadcastNode {
     }
 
     fn tick_interval(&self) -> Option<std::time::Duration> {
-        Some(std::time::Duration::from_millis(100))
+        Some(std::time::Duration::from_millis(300))
     }
 }
 

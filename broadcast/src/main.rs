@@ -1,9 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
+    time::Instant,
 };
 
-use common::{Init, Message, Node, main_loop};
+use common::{Event, Init, Message, Node, main_loop};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,15 +24,23 @@ enum Payload {
     TopologyOk,
 }
 
+#[derive(Debug, Clone)]
+struct PendingGossip {
+    dst: String,
+    message: u64,
+    last_attempt: Instant,
+}
+
 struct BroadcastNode {
     node_id: String,
     next_msg_id: usize,
     messages: HashSet<u64>,                 // Store received messages
     topology: HashMap<String, Vec<String>>, // Store topology information
+    pending: HashMap<usize, PendingGossip>,
 }
 
 impl BroadcastNode {
-    fn send(&mut self, dst: &str, payload: Payload, out: &mut dyn Write) -> anyhow::Result<()> {
+    fn send(&mut self, dst: &str, payload: Payload, out: &mut dyn Write) -> anyhow::Result<usize> {
         let msg_id = self.next_msg_id;
         self.next_msg_id += 1;
         let msg = Message {
@@ -43,7 +52,8 @@ impl BroadcastNode {
                 payload,
             },
         };
-        msg.send(out)
+        msg.send(out)?;
+        Ok(msg_id)
     }
 }
 
@@ -64,47 +74,103 @@ impl Node<Payload> for BroadcastNode {
             next_msg_id: 1,
             messages: HashSet::new(),
             topology,
+            pending: HashMap::new(),
         })
     }
-    fn step(&mut self, input: Message<Payload>, out: &mut dyn Write) -> anyhow::Result<()> {
-        match &input.body.payload {
-            Payload::Broadcast { message } => {
-                let is_new = self.messages.insert(*message);
-                if is_new {
-                    let neighbors: Vec<String> = self
-                        .topology
-                        .get(&self.node_id)
-                        .cloned()
-                        .unwrap_or_default();
 
-                    for neighbor in &neighbors {
-                        if neighbor != &input.src {
-                            self.send(neighbor, Payload::Broadcast { message: *message }, out)?;
+    fn step(&mut self, input: Event<Payload>, out: &mut dyn Write) -> anyhow::Result<()> {
+        match input {
+            Event::Message(msg) => match &msg.body.payload {
+                Payload::Broadcast { message } => {
+                    let is_new = self.messages.insert(*message);
+                    if is_new {
+                        let neighbors: Vec<String> = self
+                            .topology
+                            .get(&self.node_id)
+                            .cloned()
+                            .unwrap_or_default();
+
+                        for neighbor in &neighbors {
+                            if neighbor != &msg.src {
+                                let msg_id = self.send(
+                                    neighbor,
+                                    Payload::Broadcast { message: *message },
+                                    out,
+                                )?;
+                                self.pending.insert(
+                                    msg_id,
+                                    PendingGossip {
+                                        dst: neighbor.clone(),
+                                        message: *message,
+                                        last_attempt: Instant::now(),
+                                    },
+                                );
+                            }
                         }
                     }
-                }
-                if input.src.starts_with("c") {
-                    let reply = input.into_reply(Payload::BroadcastOk, &mut self.next_msg_id);
+
+                    let reply = msg.into_reply(Payload::BroadcastOk, &mut self.next_msg_id);
                     reply.send(out)?;
                 }
+                Payload::Read => {
+                    let reply = msg.into_reply(
+                        Payload::ReadOk {
+                            messages: self.messages.iter().copied().collect(),
+                        },
+                        &mut self.next_msg_id,
+                    );
+                    reply.send(out)?;
+                }
+                Payload::Topology { topology } => {
+                    self.topology = topology.clone();
+                    let reply = msg.into_reply(Payload::TopologyOk, &mut self.next_msg_id);
+                    reply.send(out)?;
+                }
+                Payload::BroadcastOk => {
+                    if let Some(reply_to) = msg.body.in_reply_to {
+                        self.pending.remove(&reply_to);
+                    }
+                }
+                Payload::ReadOk { .. } | Payload::TopologyOk => {}
+            },
+            Event::Tick => {
+                let now = Instant::now();
+                let pending_ids: Vec<usize> = self
+                    .pending
+                    .iter()
+                    .filter_map(|(&id, pending)| {
+                        if now.duration_since(pending.last_attempt)
+                            >= std::time::Duration::from_millis(200)
+                        {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                for old_id in pending_ids {
+                    let Some(p) = self.pending.remove(&old_id) else {
+                        continue;
+                    };
+                    let new_msg_id =
+                        self.send(&p.dst, Payload::Broadcast { message: p.message }, out)?;
+                    self.pending.insert(
+                        new_msg_id,
+                        PendingGossip {
+                            dst: p.dst,
+                            message: p.message,
+                            last_attempt: Instant::now(),
+                        },
+                    );
+                }
             }
-            Payload::Read => {
-                let reply = input.into_reply(
-                    Payload::ReadOk {
-                        messages: self.messages.iter().copied().collect(),
-                    },
-                    &mut self.next_msg_id,
-                );
-                reply.send(out)?;
-            }
-            Payload::Topology { topology } => {
-                self.topology = topology.clone();
-                let reply = input.into_reply(Payload::TopologyOk, &mut self.next_msg_id);
-                reply.send(out)?;
-            }
-            Payload::BroadcastOk | Payload::ReadOk { .. } | Payload::TopologyOk => {}
         }
         Ok(())
+    }
+
+    fn tick_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(100))
     }
 }
 

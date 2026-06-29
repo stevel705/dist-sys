@@ -1,7 +1,17 @@
-use std::io::{BufRead, Write};
+use std::{
+    io::{BufRead, Write},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Event<P> {
+    Message(Message<P>),
+    Tick,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message<P> {
@@ -62,33 +72,37 @@ pub struct Init {
 
 pub trait Node<P>: Sized {
     fn from_init(init: Init) -> anyhow::Result<Self>;
-    fn step(&mut self, input: Message<P>, out: &mut dyn Write) -> anyhow::Result<()>;
+    fn step(&mut self, event: Event<P>, out: &mut dyn Write) -> anyhow::Result<()>;
+    fn tick_interval(&self) -> Option<Duration> {
+        None
+    }
 }
 
 pub fn main_loop<N, P>() -> anyhow::Result<()>
 where
     N: Node<P>,
-    P: DeserializeOwned + Serialize,
+    P: DeserializeOwned + Serialize + Send + 'static,
 {
-    let stdin = std::io::stdin().lock();
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
     let mut stdout = std::io::stdout().lock();
 
-    let mut lines = stdin.lines();
+    let init_line = {
+        let stdin = std::io::stdin().lock();
+        let mut lines = stdin.lines();
+        lines
+            .next()
+            .context("no init message on stdin")?
+            .context("failed to read init line")?
+    };
 
-    let init_line = lines
-        .next()
-        .context("no init message on stdin")?
-        .context("failed to read init line")?;
     let init_msg: Message<InitPayload> =
         serde_json::from_str(&init_line).context("failed to parse init message")?;
     let InitPayload::Init { node_id, node_ids } = init_msg.body.payload else {
         bail!("expected Init, got something else");
     };
 
-    let node = N::from_init(Init {
-        node_id: node_id.clone(),
-        node_ids,
-    })?;
+    let mut node = N::from_init(Init { node_id, node_ids })?;
 
     let init_reply: Message<InitPayload> = Message {
         src: init_msg.dst,
@@ -101,12 +115,39 @@ where
     };
     init_reply.send(&mut stdout)?;
 
-    let mut node = node;
-    for line in lines {
-        let line = line.context("failed to read line from stdin")?;
-        let msg: Message<P> = serde_json::from_str(&line)
-            .with_context(|| format!("failed to parse message: {line}"))?;
-        node.step(msg, &mut stdout)?;
+    let (tx, rx) = mpsc::channel::<Event<P>>();
+    let tick_interval = node.tick_interval();
+
+    thread::spawn(move || {
+        let stdin = std::io::stdin().lock();
+        for line in stdin.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let msg: Message<P> = match serde_json::from_str(&line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if tx.send(Event::Message(msg)).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        let event = match tick_interval {
+            Some(d) => match rx.recv_timeout(d) {
+                Ok(e) => e,
+                Err(RecvTimeoutError::Timeout) => Event::Tick,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(e) => e,
+                Err(_) => break,
+            },
+        };
+        node.step(event, &mut stdout)?;
     }
     Ok(())
 }

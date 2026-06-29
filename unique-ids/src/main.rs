@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use common::{Init, Message, Node, main_loop};
+use common::{Event, Init, Node, main_loop};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,16 +25,19 @@ impl Node<Payload> for UniqueIdsNode {
         })
     }
 
-    fn step(&mut self, input: Message<Payload>, out: &mut dyn Write) -> anyhow::Result<()> {
-        match &input.body.payload {
-            Payload::Generate {} => {
-                let id = format!("{}-{}", self.node_id, self.next_seq);
-                self.next_seq += 1;
-                let reply = input.into_reply(Payload::GenerateOk { id }, &mut self.next_msg_id);
+    fn step(&mut self, input: Event<Payload>, out: &mut dyn Write) -> anyhow::Result<()> {
+        match input {
+            Event::Message(msg) => match msg.body.payload {
+                Payload::Generate {} => {
+                    let id = format!("{}-{}", self.node_id, self.next_seq);
+                    self.next_seq += 1;
+                    let reply = msg.into_reply(Payload::GenerateOk { id }, &mut self.next_msg_id);
 
-                reply.send(out)?;
-            }
-            Payload::GenerateOk { .. } => {}
+                    reply.send(out)?;
+                }
+                Payload::GenerateOk { .. } => {}
+            },
+            Event::Tick => {}
         }
         Ok(())
     }
